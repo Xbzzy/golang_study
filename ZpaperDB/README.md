@@ -2,6 +2,7 @@
 The purpose of this project is to understand how a BTree StorageEngine work in distributed database system.And this whole database system is divide into several module.<br>
 (Function is not yet perfect)<br>
 ## 1. B+Tree Structure
+  B-Tree is a self-blancing tree data structure with sorted data and allows serches,sequential access,insertions,and deletions in logarithmic time(depending on the order num).The B-tree is a generalization of a binary search tree in that a node can have more than two children.Unlike self-balancing binary search trees, the B-tree is well suited for storage systems that read and write relatively large blocks of data, such as discs. It is commonly used in databases and file systems.<br>
 ## 2. Disk Operation
 ## 3. Buffer Pool
 ## 4. Transaction Module
