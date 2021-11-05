@@ -378,19 +378,3 @@ func (b *BTree) Search(tree *BTree,key byte,node *BTreeNode) *FindResult {
 	r.BlockOffset = tree.DiskMap[Tmp]
 	return &r
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
