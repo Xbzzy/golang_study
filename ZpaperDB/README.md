@@ -42,10 +42,15 @@ The purpose of this project is to understand how a BTree StorageEngine work in d
   <br>
   For heavy write-throughput,another problem comes soon:The disk's limited write bandwidth is insufficient.Because it is shared with initial written and compressed threads in the background.The more data size in date system,the more write bandwidth is required by compressed.<br>
   <br>
-  If write-throughput is heavy and compression setting is not suitable for existing data written,then compression can not match the new data write rate.In this case,unmerged segment will becoming more and more untile disk space is full.And as checking more segment file,read rate become slow,too.**And here's the killer part:StorageEngine do not limiting write rate.**<br>
+  If write-throughput is heavy and compression setting is not suitable for existing data written,then compression can not match the new data write rate.In this case,unmerged segment will becoming more and more untile disk space is full.And as checking more segment file,read rate become slow,too.**And here's the killer part:StorageEngine do not limiting write rate because of it.**<br>
   <br>
 ## 2. Disk Operation
-  
+  No matter how to optimize the Memory B+tree structure,we can not forget the nature of B+tree.It is a disk index structure. So that the disk operation in this whole StorageEngine is important.The following will also be introduced separately by several modules.<br>
+  <br>
+### 2.1 Disk file structure 
+  The disk file storage is often accompanied by data encoding and decoding.We usually save data in object\structural body\list\array\hash table\tree in memory.These structures use pointer to optimize CPU access or operation.But when write data into disk file or send over the website,it used to encoding to some self-contained sequence of bytes(such as JSON).errff
+### 2.2 Fsync mechanism
+
 ## 3. Buffer Pool
 ## 4. Transaction Module
 ### 4.1 Locking
