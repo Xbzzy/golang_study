@@ -155,34 +155,39 @@ func (b *BTree) FindSite(key byte,node *BTreeNode) (uint16,error) {
 
 func (b *BTree) FindInsertSite(key byte,node *BTreeNode) uint16 {
 	i:=uint16(0)
-	for key > node.Key[i+1] && i < node.KeyNum+1 {
+	for key > node.Key[i+1] && i < node.KeyNum {
 		i++
 	}
-	return i
+	return i+1
 }
 
-func (b *BTree) FindInsertNode(key byte,node *BTreeNode) *BTreeNode {
+func (b *BTree) FindInsertDataNode(key byte,node *BTreeNode) *BTreeNode {
 	site := b.FindInsertSite(key,node)
 	if node.Children[site] != nil {
-		return b.FindInsertNode(key,node.Children[site])
+		return b.FindInsertDataNode(key,node.Children[site])
 	} else{
 		return node
 	}
 }
 
 func (b *BTree) FindNodeParent(node *BTreeNode,root *BTreeNode) *BTreeNode {
-	for i := 0 ; i<int(root.KeyNum) ; i++ {
-		if root.Children[i]!=node {
-			b.FindNodeParent(node,root.Children[i])
+	var i uint16
+	for i = 0 ; i < root.KeyNum+1 ; i++ {
+		if root.Children[i] == node {
+			return root
 		} else {
-			return root.Children[i]
+			if root.Children[i] == nil {
+				continue
+			} else {
+				b.FindNodeParent(node, root.Children[i])
+			}
 		}
 	}
 	return nil
 }
 
 func (b *BTree) InsertNode(node *BTreeNode,site uint16,data *Index,Tmp *BTreeNode) {
-	for i := node.KeyNum ; i>site ; i++ {
+	for i := node.KeyNum ; i>site ; i-- {
 		node.Key[i+1] = node.Key[i]
 		node.Value[i+1] = node.Value[i]
 		node.Children[i+1] = node.Children[i]
@@ -196,57 +201,57 @@ func (b *BTree) InsertNode(node *BTreeNode,site uint16,data *Index,Tmp *BTreeNod
 }
 
 func (b *BTree) SplitNode(parent *BTreeNode,site uint16 ) {
-	var split,i uint16
 	var MinKeyNum,MaxKeyNum uint16
 	var Tmp *BTreeNode
-	node:=parent.Children[site]
+	currentNode := parent.Children[site]
 	if b.FreeBlockNum == 0 {
 		Tmp = new(BTreeNode)
 	} else {
 		Tmp = b.MemoryMap[b.FirstFreeBlockAddress.CurrentAddress]
 	}
-	Tmp.Children[0] = node.Children[split]
-	node.Next = Tmp
-	Tmp.Pre = node
-	if node.NodeType == "index" {
+	currentNode.Next = Tmp
+	Tmp.Pre = currentNode
+	if currentNode.NodeType == "index" {
 		MinKeyNum = IndexNodeMinKeyNum
 		MaxKeyNum = IndexNodeMaxKeyNum
 	} else {
 		MinKeyNum = DataNodeMinKeyNum
 		MaxKeyNum = DataNodeMaxKeyNum
 	}
-	split = MinKeyNum
-	for i = split+1; i <= MaxKeyNum; i++ {
-		Tmp.Key[i-split] = node.Key[i]
-		Tmp.Value[i-split] = node.Value[i]
-		Tmp.Children[i-split] = node.Children[i]
+	split:= MinKeyNum
+	for i := split+1; i <= MaxKeyNum; i++ {
+		Tmp.Key[i-split] = currentNode.Key[i]
+		Tmp.Value[i-split] = currentNode.Value[i]
+		Tmp.Children[i-split] = currentNode.Children[i]
 	}
-	Tmp.KeyNum = node.KeyNum-split
-	node.KeyNum = split - 1
+	Tmp.KeyNum = currentNode.KeyNum-split
+	currentNode.KeyNum = split - 1
 }
 
 func (b *BTree) Insert(data *Index) {
 	var Tmp *BTreeNode
-	var MaxKeyNum uint16
 	if b.Root==nil {
 		b.CreatBTreeRoot(data,nil,nil)
 		return
 	} else {
-		insertNode:=b.FindInsertNode(data.Key,b.Root)
-		b.DirtyPage[insertNode]=true
-		if insertNode.NodeType == "leaf" {
-			MaxKeyNum = DataNodeMaxKeyNum
-		} else {
-			MaxKeyNum = IndexNodeMaxKeyNum
-		}
-		for {
-			site:=b.FindInsertSite(data.Key,insertNode)
-			b.InsertNode(insertNode,site,data,Tmp)
-			if insertNode.KeyNum < MaxKeyNum-2 {
+		insertDataNode:=b.FindInsertDataNode(data.Key,b.Root)
+		site:=b.FindInsertSite(data.Key,insertDataNode)
+		b.DirtyPage[insertDataNode]=true
+		if insertDataNode.KeyNum < DataNodeMaxKeyNum-1 { 		//leaf node non-full and index node non-full
+			b.InsertNode(insertDataNode,site,data,Tmp)
+			return
+		} else { 		// leaf node full and index node non-full
+			parent := b.FindNodeParent(insertDataNode, b.Root)
+			if parent.KeyNum < IndexNodeMaxKeyNum-1 {
+				b.SplitNode(parent, site)
+				b.InsertNode(parent, site, data, Tmp)
 				return
-			} else {
-				parent:=b.FindNodeParent(insertNode,b.Root)
-				b.SplitNode(parent,site)
+			} else { 		// leaf node full and index node full
+				b.SplitNode(parent, site)
+				b.InsertNode(parent, site, data, Tmp)
+				indexParent := b.FindNodeParent(parent, b.Root)
+				b.SplitNode(indexParent, site)
+				b.InsertNode(indexParent, site, data, Tmp)
 				return
 			}
 		}
@@ -349,7 +354,7 @@ func (b *BTree)Delete(tree *BTree,key byte,node *BTreeNode) (*BTreeNode,error) {
 	} else {
 		MinKeyNum = IndexNodeMaxKeyNum
 	}
-	Tmp:=b.FindInsertNode(key,node)
+	Tmp:=b.FindInsertDataNode(key,node)
 	tree.DirtyPage[Tmp]=true
 	site:=b.FindInsertSite(key,node)
 	sign,err:=b.FindSite(key,node)
@@ -370,7 +375,7 @@ func (b *BTree) Search(tree *BTree,key byte,node *BTreeNode) *FindResult {
 	if tree == nil {
 		return nil
 	}
-	Tmp:=b.FindInsertNode(key,node)
+	Tmp:=b.FindInsertDataNode(key,node)
 	site,_:=b.FindSite(key,Tmp)
 	value := Tmp.Value[site]
 	r.Value = value
