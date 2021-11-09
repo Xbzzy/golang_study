@@ -15,9 +15,9 @@ The purpose of this project is to understand how a BTree StorageEngine work in d
   <br>
   (1) leaf node non-full and index node non-full: Insert the record in leaf node directly.<br>
   <br>
-  (2) leaf node full and index node non-full: First of all,split leaf node and put the middle node in index node.Secondly,put the smaller than midder node's record on the left node and put the others on the right node.<br>
+  (2) leaf node full and index node non-full: First of all,split leaf node and put the middle key in index node.Secondly,put the smaller than midder node's record on the left node and put the others on the right node.<br>
   <br>
-  (3) leaf node full and index node full: First of all,split leaf node and put the smaller than midder node's record on the left node and put the others on the right node.Secondly,split index node and put the smaller than midder node's record on the left node and put the others on the right node.Lastly,put the middle node at the next higher order index node.<br>
+  (3) leaf node full and index node full: First of all,split leaf node and put these records smaller than midder on the left node and put the others on the right node.Secondly,split index node and put the smaller than midder node's record on the left node and put the others on the right node.Lastly,put the middle record at the next higher order index node.<br>
 ### 1.3 Deletions
   B+Tree use the fill factor to control deleted changes.50% is the smallest value.The deletions of B+tree must ensure ordered after delete,too.Unlike insert,deletions measure in terms of the change in the fill factor.We also need consider three kinds of situation in deletions.<br>
   <br>
@@ -48,9 +48,9 @@ The purpose of this project is to understand how a BTree StorageEngine work in d
   No matter how to optimize the Memory B+tree structure,we can not forget the nature of B+tree.It is a disk index structure. So that the disk operation in this whole StorageEngine is important.The following will also be introduced separately by several modules.<br>
   <br>
 ### 2.1 Disk file structure 
-  The disk file storage is often accompanied by data encoding and decoding.We usually save data in object\structural body\list\array\hash table\tree in memory.These structures use pointer to optimize CPU access or operation.But when write data into disk file or send over the website,it used to encoding to some self-contained sequence of bytes(such as JSON).errff
+  The disk file storage is often accompanied by data encoding and decoding.We usually save data in object\structural body\list\array\hash table\tree in memory.These structures use pointer to optimize CPU access or operation.But when write data into disk file or send over the website,it used to encoding to some self-contained sequence of bytes(such as JSON).
 ### 2.2 Fsync mechanism
-
+  
 ## 3. Buffer Pool
 ## 4. Transaction Module
 ### 4.1 Locking
