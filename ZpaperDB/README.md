@@ -15,7 +15,7 @@ The purpose of this project is to understand how a BTree StorageEngine work in d
   <br>
   (1) leaf node non-full and index node non-full: Insert the record in leaf node directly.<br>
   <br>
-  (2) leaf node full and index node non-full: First of all,split leaf node and put the middle key in index node.Secondly,put the smaller than midder node's record on the left node and put the others on the right node.<br>
+  (2) leaf node full and index node non-full: First of all,split leaf node and put the middle key in index node.Secondly,put the smaller than midder node's record on the left node and put the others on the right node.Then insert the record in new leaf node again.br>
   <br>
   (3) leaf node full and index node full: First of all,split leaf node and put these records smaller than midder on the left node and put the others on the right node.Secondly,split index node and put the smaller than midder node's record on the left node and put the others on the right node.Lastly,put the middle record at the next higher order index node.<br>
 ### 1.3 Deletions
