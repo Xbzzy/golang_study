@@ -95,8 +95,8 @@ func (b *BTree)InitBTree(order byte,filename string) error {
 	return nil
 }
 
-func (b *BTree) CreatBTreeRoot(data *Index,left *BTreeNode,right *BTreeNode) {
-	TmpRoot := b.CreatBTreeNode(data)
+func (b *BTree) CreatBTreeRoot(data *Index,left *BTreeNode,right *BTreeNode) *BTreeNode {
+	TmpRoot := b.CreatBTreeDataNode(data)
 	TmpRoot.KeyNum = 1
 	TmpRoot.Key[1] = data.Key
 	TmpRoot.Value[1] = data.Val
@@ -104,15 +104,31 @@ func (b *BTree) CreatBTreeRoot(data *Index,left *BTreeNode,right *BTreeNode) {
 	TmpRoot.Children[1] = right
 	b.OrderNum++
 	b.Root = TmpRoot
+	return TmpRoot
 }
 
-func (b *BTree) CreatBTreeNode(data *Index) *BTreeNode {
+func (b *BTree) CreateBTreeIndexNode(key byte) *BTreeNode {
+	if b.FreeBlockNum == 0 {
+		node := new(BTreeNode)
+		ke := new(KeyElement)
+		ke.Key=make([]byte,IndexNodeMaxKeyNum)
+		ke.Value=nil
+		node.Children=make([]*BTreeNode,IndexNodeMaxKeyNum)
+		node.KeyElement=ke
+		node.Key[1]=key
+		return node
+	} else {
+		return b.MemoryMap[b.FirstFreeBlockAddress.CurrentAddress]
+	}
+}
+
+func (b *BTree) CreatBTreeDataNode(data *Index) *BTreeNode {
 	if b.FreeBlockNum == 0 {
 		node := new(BTreeNode)
 		ke:= new(KeyElement)
-		ke.Key=make([]byte,450)
-		ke.Value=make([]string,450)
-		node.Children=make([]*BTreeNode,450)
+		ke.Key=make([]byte,DataNodeMaxKeyNum)
+		ke.Value=make([]string,DataNodeMaxKeyNum)
+		node.Children=make([]*BTreeNode,DataNodeMaxKeyNum)
 		node.KeyElement=ke
 		node.Key[1]=data.Key
 		node.Value[1]=data.Val
@@ -170,11 +186,15 @@ func (b *BTree) FindInsertDataNode(key byte,node *BTreeNode) *BTreeNode {
 	}
 }
 
-func (b *BTree) FindNodeParent(node *BTreeNode,root *BTreeNode) *BTreeNode {
+// FindNodeParent : split function need back to parent node.
+func (b *BTree) FindNodeParent(node *BTreeNode,root *BTreeNode) (*BTreeNode,uint16) {
 	var i uint16
+	if root==b.Root {
+		return nil,0
+	}
 	for i = 0 ; i < root.KeyNum+1 ; i++ {
 		if root.Children[i] == node {
-			return root
+			return root,i
 		} else {
 			if root.Children[i] == nil {
 				continue
@@ -183,7 +203,7 @@ func (b *BTree) FindNodeParent(node *BTreeNode,root *BTreeNode) *BTreeNode {
 			}
 		}
 	}
-	return nil
+	return nil,0
 }
 
 func (b *BTree) InsertNode(node *BTreeNode,site uint16,data *Index,Tmp *BTreeNode) {
@@ -200,32 +220,43 @@ func (b *BTree) InsertNode(node *BTreeNode,site uint16,data *Index,Tmp *BTreeNod
 	return
 }
 
-func (b *BTree) SplitNode(parent *BTreeNode,site uint16 ) {
+// SplitNode :when index node or data node is full,then split it.
+//the new node comes from free block in current disk file.
+func (b *BTree) SplitNode(node *BTreeNode) *BTreeNode {
 	var MinKeyNum,MaxKeyNum uint16
 	var Tmp *BTreeNode
-	currentNode := parent.Children[site]
 	if b.FreeBlockNum == 0 {
 		Tmp = new(BTreeNode)
 	} else {
 		Tmp = b.MemoryMap[b.FirstFreeBlockAddress.CurrentAddress]
 	}
-	currentNode.Next = Tmp
-	Tmp.Pre = currentNode
-	if currentNode.NodeType == "index" {
+	node.Next = Tmp
+	Tmp.Pre = node
+	if node.NodeType == "index" {
 		MinKeyNum = IndexNodeMinKeyNum
 		MaxKeyNum = IndexNodeMaxKeyNum
 	} else {
 		MinKeyNum = DataNodeMinKeyNum
 		MaxKeyNum = DataNodeMaxKeyNum
 	}
-	split:= MinKeyNum
-	for i := split+1; i <= MaxKeyNum; i++ {
-		Tmp.Key[i-split] = currentNode.Key[i]
-		Tmp.Value[i-split] = currentNode.Value[i]
-		Tmp.Children[i-split] = currentNode.Children[i]
+	splitNum:= MinKeyNum
+	for i := splitNum+1; i <= MaxKeyNum; i++ {
+		Tmp.Key[i-splitNum] = node.Key[i]
+		Tmp.Value[i-splitNum] = node.Value[i]
+		Tmp.Children[i-splitNum] = node.Children[i]
 	}
-	Tmp.KeyNum = currentNode.KeyNum-split
-	currentNode.KeyNum = split - 1
+	Tmp.KeyNum = node.KeyNum-splitNum
+	node.KeyNum = splitNum - 1
+	return Tmp
+}
+
+func (b *BTree) AdjustAfterSplit(parent *BTreeNode,tmpSplitNode *BTreeNode,site uint16) {
+	for i := parent.KeyNum+1; i>site; i--{
+		parent.Key[i+1] = parent.Key[i]
+		parent.Children[i+1] = parent.Children[i]
+	}
+	parent.Key[site+1] = tmpSplitNode.Key[1]
+	parent.Children[site+1] = tmpSplitNode
 }
 
 func (b *BTree) Insert(data *Index) {
@@ -241,17 +272,20 @@ func (b *BTree) Insert(data *Index) {
 			b.InsertNode(insertDataNode,site,data,Tmp)
 			return
 		} else { 		// leaf node full and index node non-full
-			parent := b.FindNodeParent(insertDataNode, b.Root)
+			parent,site := b.FindNodeParent(insertDataNode, b.Root)
 			if parent.KeyNum < IndexNodeMaxKeyNum-1 {
-				b.SplitNode(parent, site)
+				TmpSplit := b.SplitNode(insertDataNode)
+				b.AdjustAfterSplit(parent,TmpSplit,site)
 				b.InsertNode(parent, site, data, Tmp)
 				return
 			} else { 		// leaf node full and index node full
-				b.SplitNode(parent, site)
+				TmpSplit := b.SplitNode(insertDataNode)
+				b.AdjustAfterSplit(parent,TmpSplit,site)
 				b.InsertNode(parent, site, data, Tmp)
-				indexParent := b.FindNodeParent(parent, b.Root)
-				b.SplitNode(indexParent, site)
-				b.InsertNode(indexParent, site, data, Tmp)
+				indexParent,indexSite := b.FindNodeParent(parent, b.Root)
+				TmpSplit2 := b.SplitNode(indexParent)
+				b.AdjustAfterSplit(indexParent,TmpSplit2,indexSite)
+				b.InsertNode(indexParent, indexSite, data, Tmp)
 				return
 			}
 		}
