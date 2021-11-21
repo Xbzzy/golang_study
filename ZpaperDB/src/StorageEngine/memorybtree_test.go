@@ -7,23 +7,18 @@ import (
 	"strconv"
 )
 
-type Test struct {
-	Errors error
-}
-
 func (t *Test)TestCreateBTree() *BTree {
 	btree:=new(BTree)
-	_=btree.InitBTree(3,"test.txt")
-	for i:=0;i<300;i++ {
-		TmpIndex:=btree.CreateIndex(byte(i),"")
+	_=btree.InitBTree(3,"data")
+	for i:=0;i<10;i++ {
+		TmpIndex:=btree.CreateIndex(byte(i),strconv.Itoa(i))
 		btree.Insert(TmpIndex)
 	}
 	return btree
 }
 
-func (t *Test) TestInsert(tree *BTree)  {
-	insertNum := rand.Intn(100000)
-	for i:=0;i<insertNum;i++ {
+func (t *Test) TestInsert(tree *BTree,MaxInsertNum int)  {
+	for i:=10; i < MaxInsertNum; i++ {
 		TmpIndex:=tree.CreateIndex(byte(i), strconv.Itoa(i))
 		tree.Insert(TmpIndex)
 	}
@@ -55,4 +50,15 @@ func (t *Test) TestSearch(tree *BTree,MaxSearchNum uint16) {
 		}
 	}
 	return
+}
+
+func (t *Test) TestTraverseDataNode(tree *BTree)  {
+	temp := tree.StartLeafNode
+	for {
+		fmt.Println(temp.Key[1])
+		if temp.Next == nil {
+			return
+		}
+		temp = temp.Next
+	}
 }
