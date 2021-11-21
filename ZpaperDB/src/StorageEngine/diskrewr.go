@@ -3,7 +3,6 @@ package storage
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"syscall"
 )
@@ -23,11 +22,32 @@ type diskNode struct {
 
 type diskOperation struct {
 	*os.File
+	*diskNode
+}
+
+func (b *BTree) InitDiskNode() *diskNode {
+	tmpDiskNode:=new(diskNode)
+	ke:= new(KeyElement)
+	tmpDiskNode.ChildrenOffset=make([]uint64,DataNodeMaxKeyNum)
+	ke.Key=make([]byte,DataNodeMaxKeyNum)
+	ke.Value=make([]string,DataNodeMaxKeyNum)
+	tmpDiskNode.KeyElement=*ke
+	return tmpDiskNode
+}
+
+func (b *BTree) InitBTreeNode() *BTreeNode {
+	node := new(BTreeNode)
+	ke:= new(KeyElement)
+	ke.Key=make([]byte,DataNodeMaxKeyNum)
+	ke.Value=make([]string,DataNodeMaxKeyNum)
+	node.Children=make([]*BTreeNode,DataNodeMaxKeyNum)
+	node.KeyElement=ke
+	return node
 }
 
 func (b *BTree) RefactorBTreeNode(node *BTreeNode) *diskNode {
 	var i uint16
-	Tmp:=new(diskNode)
+	Tmp:=b.InitDiskNode()
 	Tmp.KeyNum=node.KeyNum
 	Tmp.Key=node.Key
 	Tmp.Value=node.Value
@@ -42,7 +62,7 @@ func (b *BTree) RefactorBTreeNode(node *BTreeNode) *diskNode {
 
 func (b *BTree) RefactorDiskNode(node *diskNode) *BTreeNode {
 	var i uint16
-	Tmp:=new(BTreeNode)
+	Tmp:=b.InitBTreeNode()
 	Tmp.KeyNum=node.KeyNum
 	Tmp.Key=node.Key
 	Tmp.Value=node.Value
@@ -72,16 +92,18 @@ func (d *diskNode) DecodingJsonToDiskNode(data []byte) (*diskNode,error) {
 	return node,nil
 }
 
-func (b *BTree) InitSoredNodeOffset (node *BTreeNode,sum uint16) {
-	var i uint16
-	if b.IsLeaf(node)==true {
-		return
-	}
-	sum++
-	for i=0; i<node.KeyNum+1; i++ {
-		node.CurrentOffset=uint64(sum-1)*pageSize
-		b.UpdateMap(node,node.CurrentOffset)
-		b.InitSoredNodeOffset(node.Children[i],sum)
+func (b *BTree) InitDataNodeOffset () {
+	currentNum:=1
+	tempPointer:=b.StartLeafNode
+	for {
+		tempPointer.CurrentOffset=uint64(currentNum-1)*pageSize
+		currentNum++
+		b.UpdateMap(tempPointer,tempPointer.CurrentOffset)
+		if tempPointer.Next != nil {
+			tempPointer=tempPointer.Next
+		} else {
+			return
+		}
 	}
 }
 
@@ -104,13 +126,9 @@ func (b *BTree) WriteSoredNode (file *os.File) error {
 		memoryAddress.HasLoaded=false
 		tmp:=b.RefactorBTreeNode(memoryAddress)
 		data,_:=tmp.EncodingDiskNodeToJson(tmp)
-		_, err := file.Seek(int64(diskAddress),0)
+		_, err := file.WriteAt(data,int64(diskAddress))
 		if err != nil {
 			return err
-		}
-		_, err1 := file.Write(data)
-		if err1 != nil {
-			return err1
 		}
 	}
 	return nil
@@ -121,64 +139,69 @@ func (b *BTree) UpdateMap (node *BTreeNode,offset uint64) {
 	b.DiskMap[node]=offset
 }
 
-func (b *BTree) FsyncAll(tree *BTree) error {
-	sum:=0
-	tree.InitSoredNodeOffset(tree.Root,uint16(sum))
-	TmpFile,err:=os.OpenFile(tree.FileName,syscall.O_RDWR,0666)
+func (b *BTree) FsyncAll() error {
+	b.InitDataNodeOffset()
+	TmpFile,err:=os.OpenFile(b.FileName,syscall.O_RDWR,0666)
 	if err != nil {
-		fmt.Println(err)
 		return err
 	}
 	defer TmpFile.Close()
-	err1:=tree.WriteSoredNode(TmpFile)
+	err1:=b.WriteSoredNode(TmpFile)
 	if err1!=nil {
 		return err1
 	}
 	return nil
 }
 
-func (d *diskOperation) ReadNodeFromFile(node *BTreeNode,tree *BTree) error {
-	var TmpDiskNode *diskNode
-	var err3 error
-	data:=make([]byte,pageSize)
-	TmpFile,err:=os.OpenFile(tree.FileName,syscall.O_RDWR,0666)
-	if err!=nil {
+func (b *BTree) ReadNodeFromFile(node *BTreeNode) error {
+	if node == nil {
+		return errors.New("read error: nil page")
+	}
+	data := make([]byte,pageSize)
+	TmpFile,err := os.OpenFile(b.FileName,syscall.O_RDWR,0666)
+	if err != nil {
 		return err
 	}
 	defer TmpFile.Close()
-	offset:=tree.DiskMap[node]
-	_, err1 := TmpFile.Seek(int64(offset),0)
-	if err1!=nil {
+	offset := b.DiskMap[node]
+	_,err1 := TmpFile.ReadAt(data,int64(offset))
+	if err1 != nil {
 		return err1
 	}
-	_,err2:=TmpFile.Read(data)
-	if err2!=nil {
+	TmpDiskNode,err2:=b.DecodingJsonToDiskNode(data)
+	if err2 != nil{
 		return err2
 	}
-	TmpDiskNode,err3=TmpDiskNode.DecodingJsonToDiskNode(data)
-	if err3!=nil {
-		return err3
-	}
-	node=tree.RefactorDiskNode(TmpDiskNode)
+	node=b.RefactorDiskNode(TmpDiskNode)
 	node.HasLoaded=true
 	return nil
 }
 
-func (b *BTree) FindNodeFromDisk(key byte,node *BTreeNode,tree *BTree) (*BTreeNode,error) {
-	var i uint16
-	for i=0 ; key < node.Key[i] && i < node.KeyNum; {
-		i++
-	}
-	err := tree.ReadNodeFromFile(node, tree)
+func (b *BTree) FindNodeFromDisk(key byte,node *BTreeNode) (*BTreeNode,error) {
+	site := b.SearchSite(key,node)
+	err := b.ReadNodeFromFile(node.Children[site])
 	if err != nil {
 		return nil,err
 	}
-	if node.Key[i]==key {
+	if node.Children[site] != nil {
+		return b.FindNodeFromDisk(key,node.Children[site])
+	} else{
 		return node,nil
 	}
-	_,err1:=tree.FindNodeFromDisk(key,node.Children[i],tree)
+}
+
+func (b *BTree) SearchFromDisk(key byte) (*FindResult,error) {
+	tmpResult := new(FindResult)
+	node,err1 := b.FindNodeFromDisk(key,b.Root)
 	if err1 != nil {
 		return nil,err1
 	}
-	return nil,errors.New("find: can not find the node from disk")
+	site, err2 := b.FindSite(key, node)
+	if err2 != nil {
+		return nil, err2
+	}
+	tmpResult.BlockOffset = b.DiskMap[node]
+	tmpResult.Value = node.Value[site]
+	tmpResult.Founded = true
+	return tmpResult,nil
 }
