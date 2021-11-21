@@ -66,16 +66,16 @@ type FindResult struct {
 	Value string
 }
 
-func (b *BTree)InitBTree(order byte,filename string) error {
+func (b *BTree)InitBTree(order byte,fileName string) error {
 	args:=new(BTreeArgs)
 	b.BTreeArgs=args
 	b.OrderNum=order
-	file,err:=os.Create(filename)
+	file,err:=os.Create(fileName)
 	if err!=nil {
 		return errors.New("file error: create file failed")
 	}
 	defer file.Close()
-	b.FileName=filename
+	b.FileName=fileName
 	att:=new(AddressTranslationTable)
 	b.AddressTranslationTable=att
 	b.AddressTranslationTable.MemoryMap=make(map[uint64]*BTreeNode)
@@ -93,6 +93,17 @@ func (b *BTree) CreatBTreeRoot(data *Index,left *BTreeNode,right *BTreeNode) *BT
 	TmpRoot.KeyNum = 1
 	TmpRoot.Key[1] = data.Key
 	TmpRoot.Value[1] = data.Val
+	TmpRoot.Children[0] = left
+	TmpRoot.Children[1] = right
+	b.OrderNum++
+	b.Root = TmpRoot
+	return TmpRoot
+}
+
+func (b *BTree) CreatIndexBTreeRoot(data *Index,left *BTreeNode,right *BTreeNode) *BTreeNode {
+	TmpRoot := b.CreateBTreeIndexNode(data.Key)
+	TmpRoot.KeyNum = 1
+	TmpRoot.Key[1] = data.Key
 	TmpRoot.Children[0] = left
 	TmpRoot.Children[1] = right
 	b.OrderNum++
@@ -228,14 +239,18 @@ func (b *BTree) InsertNode(node *BTreeNode,site uint16,data *Index,Tmp *BTreeNod
 	node.Children[site] = Tmp
 	node.KeyNum++
 	b.DirtyPage[node]=true
+	//b.UpdateStartLeafNode(b.Root)
 	return
 }
 
 // SplitNode :when index node or data node is full,then split it.
 //the new node comes from free block in current disk file.
+//the pre node save MaxKeyNum/2 keys/values,and another save (MaxKeyNum/2)-1 keys/values
 func (b *BTree) SplitNode(node *BTreeNode) *BTreeNode {
 	var MinKeyNum,MaxKeyNum uint16
 	var Tmp *BTreeNode
+	//if node == b.StartLeafNode {
+	//}
 	if node.NodeType == "index" {
 		MinKeyNum = IndexNodeMinKeyNum
 		MaxKeyNum = IndexNodeMaxKeyNum
@@ -265,6 +280,7 @@ func (b *BTree) SplitNode(node *BTreeNode) *BTreeNode {
 	return Tmp
 }
 
+//AdjustAfterSplit : adjust pointer relationship between splitedNode and newNode
 func (b *BTree) AdjustAfterSplit(parent *BTreeNode,tmpSplitNode *BTreeNode,site uint16) {
 	for i := parent.KeyNum+1; i>site; i--{
 		parent.Key[i+1] = parent.Key[i]
@@ -272,18 +288,30 @@ func (b *BTree) AdjustAfterSplit(parent *BTreeNode,tmpSplitNode *BTreeNode,site 
 	}
 	parent.Key[site+1] = tmpSplitNode.Key[1]
 	parent.Children[site+1] = tmpSplitNode
+	parent.KeyNum++
+}
+
+func (b *BTree) UpdateStartLeafNode(root *BTreeNode)  {
+	for {
+		if root.Children[0] == nil {
+			b.StartLeafNode = root
+		} else {
+			b.UpdateStartLeafNode(root.Children[0])
+		}
+	}
 }
 
 func (b *BTree) Insert(data *Index) {
 	var Tmp *BTreeNode
-	if b.Root==nil {
+	if b.Root == nil {
 		b.CreatBTreeRoot(data,nil,nil)
+		b.StartLeafNode = b.Root
 		return
 	} else {
 		insertDataNode:=b.FindInsertDataNode(data.Key,b.Root)
 		if insertDataNode.KeyNum < DataNodeMaxKeyNum-1 {
-			insertSite:=b.FindInsertSite(data.Key,insertDataNode)
-			b.DirtyPage[insertDataNode]=true//leaf node non-full and index node non-full
+			insertSite := b.FindInsertSite(data.Key,insertDataNode)
+			b.DirtyPage[insertDataNode] = true//leaf node non-full and index node non-full
 			b.InsertNode(insertDataNode,insertSite,data,Tmp)
 			return
 		} else { 		// leaf node full and index node non-full
@@ -291,9 +319,18 @@ func (b *BTree) Insert(data *Index) {
 			if parent == nil { 		//leaf node full and the current node is btree root
 				TmpSplit := b.SplitNode(insertDataNode)
 				TmpIndex := b.CreateIndex(TmpSplit.Key[1],"")
-				b.CreatBTreeRoot(TmpIndex,insertDataNode,TmpSplit)
+				b.CreatIndexBTreeRoot(TmpIndex,insertDataNode,TmpSplit)
+				if data.Key > TmpIndex.Key {
+					insertSite := b.FindInsertSite(data.Key,TmpSplit)
+					b.DirtyPage[TmpSplit] = true
+					b.InsertNode(TmpSplit,insertSite,data,Tmp)
+				} else {
+					insertSite := b.FindInsertSite(data.Key,insertDataNode)
+					b.DirtyPage[insertDataNode] = true
+					b.InsertNode(insertDataNode,insertSite,data,Tmp)
+				}
 				return
-			}else {
+			}else {       //leaf node full and the current node is not root with non-full
 				if parent.KeyNum < IndexNodeMaxKeyNum-1 {
 					TmpSplit := b.SplitNode(insertDataNode)
 					b.AdjustAfterSplit(parent, TmpSplit, site)
@@ -405,6 +442,7 @@ func (b *BTree) AdjustBTree(tree *BTree,node *BTreeNode,site uint16) {
 
 func (b *BTree)Delete(key byte) error {
 	var MinKeyNum uint16
+	//defer b.UpdateStartLeafNode(b.Root)
 	node := b.FindInsertDataNode(key,b.Root)
 	if node.NodeType == "leaf" {
 		MinKeyNum = DataNodeMaxKeyNum
