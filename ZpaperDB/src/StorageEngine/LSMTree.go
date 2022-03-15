@@ -1,0 +1,503 @@
+package storage
+
+import (
+	"bytes"
+	"encoding/binary"
+	"math/rand"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// RBTree act as a LSMTree memoryTree basic workflow:
+// While writing in, put the data in memory self-balancing tree(Red-Black Tree),
+// this memoryTree called memoryTable,when memoryTable greater than a certain
+// threshold size(usually a few megabytes),write it in disk as a SSTable file.
+// Because memoryTree has been maintained key-value sorted by key, so write disk
+// will be efficient.New SSTable file has been the newest part of the database system.
+// While SSTable writing in disk,write request will insert into new RBtree instance.
+// In order to deal with write request, first try to search key in memory table,
+// then is the newest section of the disk file, the following is more old disk file.
+// And so on, until find the target data(or nil).Background process will perform
+// merge and compress periodically,for perform multi-sectionDiskFile.And discard
+// old data that has been overwritten or deleted.
+const (
+	red          = true
+	black        = false
+	tableMaxSize = 4194304 // 4MB
+)
+
+// RBTree nature :
+// Every node's color is red or black.
+// Root node's color is black.
+// If a node is red, then its children nodes is black.
+// For every node, the path from current node to
+// its descendant leaf nodes, all include an equal number black node.
+// All of above condition is in order to ensure that
+// the longest path no more than double of the shortest path.
+
+type LSMTree struct {
+	mu         *sync.Mutex
+	memoryTree []*RBTree
+	treeNum    int
+	memoryHash []*map[int]int
+	dataFile   []*os.File
+	ssTableNum int
+	reDoLog    *os.File
+}
+
+type RBTree struct {
+	root         *RBTreeNode
+	pairs        []dataPair
+	full         bool
+	dataSize     int
+	ssTableIndex int
+}
+
+type RBTreeNode struct {
+	key    int
+	value  interface{}
+	color  bool //true is red,false is black.
+	left   *RBTreeNode
+	right  *RBTreeNode
+	parent *RBTreeNode
+}
+
+type dataPair struct {
+	key       int
+	value     interface{}
+	tombstone bool
+}
+
+func (lsm *LSMTree) initLSMTree() (*LSMTree, error) {
+	tree := new(LSMTree)
+	return tree, nil
+}
+
+func (lsm *LSMTree) initRBTree() *RBTree {
+	lsm.mu.Lock()
+	defer lsm.mu.Unlock()
+	tree := new(RBTree)
+	tree.full = false
+	lsm.ssTableNum++
+	tree.ssTableIndex = lsm.ssTableNum
+	lsm.memoryTree[lsm.treeNum] = tree
+	lsm.treeNum++
+	return tree
+}
+
+func (rb *RBTree) findInsertSite(key int, node *RBTreeNode) (*RBTreeNode, *RBTreeNode) {
+	if key > node.key {
+		if node.right == nil {
+			return node, node.right
+		}
+		rb.findInsertSite(key, node.right)
+	} else {
+		if node.left == nil {
+			return node, node.left
+		}
+		rb.findInsertSite(key, node.left)
+	}
+	return nil, nil
+}
+
+func (rb *RBTree) reAdjustColor(cur *RBTreeNode) {
+	var uncle *RBTreeNode
+	parent := cur.parent
+	pParent := cur.parent.parent
+	if cur == cur.parent.left {
+		uncle = cur.parent.right
+	} else {
+		uncle = cur.parent.left
+	}
+	if pParent == rb.root {
+		parent.color = black
+		uncle.color = black
+		return
+	}
+	parent.color = black
+	uncle.color = black
+	pParent.color = red
+	rb.reAdjustColor(pParent)
+}
+
+func (rb *RBTree) rightSignSpin(cur *RBTreeNode) {
+	var tmpRoot *RBTreeNode
+	parent := cur
+	pParent := cur.parent
+	if pParent == rb.root {
+		parent.right = pParent
+		pParent.color = red
+		pParent.left = nil
+		pParent.parent = parent
+		rb.root = parent
+		rb.root.color = black
+		return
+	} else {
+		tmpRoot = pParent.parent
+		if tmpRoot.left == pParent {
+			parent.right = pParent
+			pParent.color = red
+			pParent.left = nil
+			pParent.parent = parent
+			tmpRoot.left = parent
+			tmpRoot.left.color = black
+			return
+		} else {
+			parent.right = pParent
+			pParent.color = red
+			pParent.left = nil
+			pParent.parent = parent
+			tmpRoot.right = parent
+			tmpRoot.right.color = black
+			return
+		}
+	}
+}
+
+func (rb *RBTree) leftSignSpin(cur *RBTreeNode) {
+	var tmpRoot *RBTreeNode
+	parent := cur
+	pParent := cur.parent
+	if pParent == rb.root {
+		parent.left = rb.root
+		pParent.color = red
+		pParent.right = nil
+		pParent.parent = parent
+		rb.root = parent
+		rb.root.color = black
+		return
+	} else {
+		tmpRoot = pParent.parent
+		if tmpRoot.left == pParent {
+			parent.left = pParent
+			pParent.color = red
+			pParent.right = nil
+			pParent.parent = parent
+			tmpRoot.left = parent
+			tmpRoot.left.color = black
+			return
+		} else {
+			parent.left = pParent
+			pParent.color = red
+			pParent.right = nil
+			pParent.parent = parent
+			tmpRoot.right = parent
+			tmpRoot.right.color = black
+			return
+		}
+	}
+}
+
+func (rbn *RBTreeNode) insertData(key int, value interface{}, parent *RBTreeNode) {
+	rbn.key = key
+	rbn.value = value
+	rbn.parent = parent
+	rbn.color = red
+	return
+}
+
+func (rb *RBTree) addDataSize(key int, value interface{}) {
+	tmpDataPair := new(dataPair)
+	tmpDataPair.key = key
+	tmpDataPair.value = value
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.BigEndian, tmpDataPair)
+	if err != nil {
+		rb.addDataSize(key, value)
+		return
+	}
+	rb.dataSize += buf.Len()
+	if rb.dataSize > tableMaxSize {
+		rb.full = true
+	}
+	return
+}
+
+func (rb *RBTree) insert(key int, value interface{}) {
+	var uncle *RBTreeNode
+	rb.addDataSize(key, value)
+	if rb.root == nil {
+		rb.root = new(RBTreeNode)
+		rb.root.key = key
+		rb.root.value = value
+		rb.root.color = black
+		return
+	}
+	parent, insertSite := rb.findInsertSite(key, rb.root)
+	if parent.color == black {
+		insertSite.insertData(key, value, parent)
+		return
+	}
+	insertSite.insertData(key, value, parent)
+	cur := insertSite
+	pParent := parent.parent
+	if parent.left == cur {
+		uncle = parent.right
+	} else {
+		uncle = parent.left
+	}
+	if uncle != nil && uncle.color == red {
+		rb.reAdjustColor(cur)
+		return
+	}
+	if cur == parent.left && parent == pParent.left {
+		rb.rightSignSpin(cur.parent)
+		return
+	} else if cur == parent.right && parent == pParent.right {
+		rb.leftSignSpin(cur.parent)
+		return
+	} else if cur == parent.right && parent == pParent.left {
+		rb.leftSignSpin(cur)
+		cur.color = red
+		rb.rightSignSpin(cur)
+		return
+	} else if cur == parent.left && parent == pParent.right {
+		rb.rightSignSpin(cur)
+		cur.color = red
+		rb.leftSignSpin(cur)
+		return
+	}
+	return
+}
+
+func (rbn *RBTreeNode) deleteLeafAdjust(parent *RBTreeNode) {
+	if rbn.color == black {
+		if rbn.left == nil && rbn.right == nil {
+			if parent.color == red {
+				parent.left = nil
+				parent.color = black
+				rbn.color = red
+			} else {
+				parent.left = nil
+				rbn.color = red
+				// in order to maintain number of black, have to adjust.
+			}
+		} else if rbn.left.color == red {
+			parent.left = nil
+			newParent := rbn.left
+			if parent == parent.parent.left {
+				parent.parent.left = newParent
+			} else {
+				parent.parent.right = newParent
+			}
+			newParent.parent = parent.parent
+			newParent.color = parent.color
+			newParent.left = parent
+			newParent.right = rbn
+			parent.color = black
+			parent.parent = newParent
+			rbn.parent = newParent
+			rbn.left = nil
+		} else if rbn.right.color == red {
+			parent.left = nil
+			newParent := rbn
+			if parent == parent.parent.left {
+				parent.parent.left = newParent
+			} else {
+				parent.parent.right = newParent
+			}
+			newParent.parent = parent.parent
+			newParent.color = parent.color
+			newParent.left = parent
+			newParent.right.color = black
+			parent.color = black
+			parent.right = rbn.left
+			parent.parent = newParent
+			newParent.right.parent = parent
+		}
+	} else {
+		parent.left = nil
+		if parent == parent.parent.left {
+			parent.parent.left = rbn
+		} else {
+			parent.parent.right = rbn
+		}
+		parent.right = rbn.left
+		rbn.left.parent = parent
+		rbn.left = parent
+		rbn.parent = parent.parent
+		parent.parent = rbn
+		parent.color = red
+		rbn.color = black
+	}
+}
+
+func (rb *RBTree) deleteNode(key int) bool {
+	deleted, sign := rb.root.search(key)
+	if sign == false {
+		return false
+	}
+	parent := deleted.parent
+	if deleted.left == nil && deleted.right == nil { // deleted node is a leaf node.
+		if deleted.color == red {
+			if deleted == parent.left {
+				parent.left = nil
+			} else {
+				parent.right = nil
+			}
+		} else {
+			if deleted == parent.left {
+				bro := parent.right
+				bro.deleteLeafAdjust(parent)
+			} else {
+				bro := parent.left
+				bro.deleteLeafAdjust(parent)
+			}
+		}
+	}
+	if deleted.left == nil || deleted.right != nil {
+		child := deleted.right
+		if deleted == deleted.parent.left {
+			deleted.parent.left = child
+		} else {
+			deleted.parent.right = child
+		}
+		child.parent = deleted.parent
+		child.color = black
+	} else if deleted.left != nil || deleted.right == nil {
+		child := deleted.left
+		if deleted == deleted.parent.left {
+			deleted.parent.left = child
+		} else {
+			deleted.parent.right = child
+		}
+		child.parent = deleted.parent
+		child.color = black
+	}
+	if deleted.left != nil && deleted.right != nil {
+		tmpKey := deleted.right.key
+		deleted.right.key = deleted.key
+		deleted.key = tmpKey
+		deleted.value = deleted.right.value
+		rb.deleteNode(key)
+	}
+	return true
+}
+
+func (rb *RBTree) changeValue(key int, newValue interface{}) bool {
+	changeNode, sign := rb.root.search(key)
+	if sign == false {
+		return sign
+	} else {
+		changeNode.value = newValue
+		return true
+	}
+}
+
+func (rbn *RBTreeNode) search(key int) (*RBTreeNode, bool) {
+	if key == rbn.key {
+		return rbn, true
+	} else if key > rbn.key {
+		if rbn.right == nil {
+			return nil, false
+		}
+		rbn.right.search(key)
+	} else {
+		if rbn.left == nil {
+			return nil, false
+		}
+		rbn.left.search(key)
+	}
+	return nil, false
+}
+
+func (rb *RBTree) inorder(cur *RBTreeNode, num *int) {
+	if cur == nil {
+		return
+	}
+	rb.inorder(cur.left, num)
+	rb.pairs[*num].key = cur.key
+	rb.pairs[*num].value = cur.value
+	*num++
+	rb.inorder(cur.right, num)
+}
+
+func (lsm *LSMTree) setMemoryHash(key int, offSet int, ssTableNum int) {
+	lsm.mu.Lock()
+	defer lsm.mu.Unlock()
+	tmpMap := lsm.memoryHash[ssTableNum]
+	(*tmpMap)[key] = offSet
+	return
+}
+
+func (lsm *LSMTree) encodingToBuf(instance *RBTree) (*bytes.Buffer, error) {
+	var num *int
+	var curSize int
+	root := instance.root
+	instance.inorder(root, num)
+	buf := new(bytes.Buffer)
+	for i := 0; i < len(instance.pairs); i++ {
+		err := binary.Write(buf, binary.BigEndian, instance.pairs[i])
+		if err != nil {
+			return nil, err
+		}
+		curSize += buf.Len()
+		if curSize > 4096 {
+			lsm.setMemoryHash(instance.pairs[i+1].key, curSize, instance.ssTableIndex)
+		}
+	}
+	return buf, nil
+}
+
+func (lsm *LSMTree) writeToDisk(buf *bytes.Buffer) error {
+	var tmpLen int
+	var err, err1, err2 error
+	lsm.mu.Lock()
+	defer lsm.mu.Unlock()
+	lsm.dataFile[lsm.ssTableNum], err = os.Create("SSTable" + strconv.Itoa(lsm.ssTableNum))
+	if err != nil {
+		return err
+	}
+	for i := 0; i < 4194304; i += tmpLen {
+		tmpData := new([]byte)
+		_, err1 = buf.Read(*tmpData)
+		if err1 != nil {
+			return err1
+		}
+		tmpLen, err2 = lsm.dataFile[lsm.ssTableNum].Write(*tmpData)
+		if err2 != nil {
+			return err2
+		}
+	}
+	lsm.ssTableNum++
+	return nil
+}
+
+func (lsm *LSMTree) syncToDisk() {
+	var wg sync.WaitGroup
+	for {
+		for i := 0; i < lsm.treeNum; i++ {
+			if lsm.memoryTree[i].full == true {
+				wg.Add(1)
+				go func() {
+					buf, err := lsm.encodingToBuf(lsm.memoryTree[i])
+					if err != nil {
+						buf, err = lsm.encodingToBuf(lsm.memoryTree[i])
+					}
+					err1 := lsm.writeToDisk(buf)
+					if err1 != nil {
+						err1 = lsm.writeToDisk(buf)
+					}
+					wg.Done()
+				}()
+			}
+		}
+		wg.Wait()
+		randTime := 200 + rand.Intn(300)
+		time.Sleep(time.Duration(randTime) * time.Millisecond)
+	}
+}
+
+func (lsm *LSMTree) makeLSMTree() error {
+	tmpLSMTree, err := lsm.initLSMTree()
+	if err != nil {
+		return err
+	}
+	tmpLSMTree.memoryTree[0] = lsm.initRBTree()
+	go lsm.syncToDisk()
+	return nil
+}
+
+// redoLog and instance buffer pool.
