@@ -26,9 +26,11 @@ import (
 // merge and compress periodically,for perform multi-sectionDiskFile.And discard
 // old data that has been overwritten or deleted.
 const (
-	red          = true
-	black        = false
-	tableMaxSize = 4194304 // 4MB
+	red                = true
+	black              = false
+	tableMaxSize       = 4194304 // memory table max size = 4MB
+	fpp                = 0.05    // for the time false positive probability being as 0.05
+	exceptedInsertions = 10000   // for the time excepted insertions being as 10000
 )
 
 // RBTree nature :
@@ -44,33 +46,34 @@ type LSMTree struct {
 	mu         *sync.Mutex
 	memoryTree []*RBTree
 	treeNum    int
-	memoryHash []*map[int]int64
+	memoryHash []*map[*[]byte]int64
 	dataFile   []*os.File
 	ssTableNum int
 	restoreLog *os.File
+	bf         *bloomFilter
 }
 
 type RBTree struct {
 	mu           *sync.Mutex
 	root         *RBTreeNode
-	pairs        []dataPair
+	pairs        []entry
 	full         bool
 	dataSize     int
 	ssTableIndex int
 }
 
 type RBTreeNode struct {
-	key    int
-	value  interface{}
+	key    []byte
+	value  []byte
 	color  bool //true is red,false is black.
 	left   *RBTreeNode
 	right  *RBTreeNode
 	parent *RBTreeNode
 }
 
-type dataPair struct {
-	key       int
-	value     interface{}
+type entry struct {
+	key       []byte
+	value     []byte
 	tombstone bool
 }
 
@@ -78,12 +81,12 @@ type logEntry struct {
 	logPrefix  string
 	nowTime    time.Time
 	curTreeNum int
-	data       dataPair
+	data       *entry
 }
 
 type WriteArgs struct {
-	Key   int
-	Value interface{}
+	Key   []byte
+	Value []byte
 }
 
 type WriteReply struct {
@@ -92,17 +95,29 @@ type WriteReply struct {
 }
 
 type ReadArgs struct {
-	Key int
+	Key []byte
 }
 
 type ReadReply struct {
-	Value interface{}
+	Value []byte
 	Found bool
 	err   error
 }
 
 func (lsm *LSMTree) initLSMTree() (*LSMTree, error) {
+	var err error
 	tree := new(LSMTree)
+	tree.memoryTree = make([]*RBTree, 4)
+	tree.dataFile = make([]*os.File, 10)
+	tree.memoryHash = make([]*map[*[]byte]int64, 100)
+	for i := 0; i < 100; i++ {
+		tmpMap := make(map[*[]byte]int64)
+		tree.memoryHash[i] = &tmpMap
+	}
+	tree.bf, err = MakeBloomFilter(fpp, exceptedInsertions)
+	if err != nil {
+		return tree, err
+	}
 	return tree, nil
 }
 
@@ -117,8 +132,8 @@ func (lsm *LSMTree) initRBTree() *RBTree {
 	return tree
 }
 
-func (rb *RBTree) findInsertSite(key int, node *RBTreeNode) (*RBTreeNode, *RBTreeNode) {
-	if key > node.key {
+func (rb *RBTree) findInsertSite(key []byte, node *RBTreeNode) (*RBTreeNode, *RBTreeNode) {
+	if bytes.Compare(key, node.key) == 1 {
 		if node.right == nil {
 			return node, node.right
 		}
@@ -220,7 +235,7 @@ func (rb *RBTree) leftSignSpin(cur *RBTreeNode) {
 	}
 }
 
-func (rbn *RBTreeNode) insertData(key int, value interface{}, parent *RBTreeNode) {
+func (rbn *RBTreeNode) insertData(key []byte, value []byte, parent *RBTreeNode) {
 	rbn.key = key
 	rbn.value = value
 	rbn.parent = parent
@@ -228,8 +243,8 @@ func (rbn *RBTreeNode) insertData(key int, value interface{}, parent *RBTreeNode
 	return
 }
 
-func (rb *RBTree) addDataSize(key int, value interface{}) {
-	tmpDataPair := new(dataPair)
+func (rb *RBTree) addDataSize(key []byte, value []byte) {
+	tmpDataPair := new(entry)
 	tmpDataPair.key = key
 	tmpDataPair.value = value
 	buf := new(bytes.Buffer)
@@ -245,14 +260,15 @@ func (rb *RBTree) addDataSize(key int, value interface{}) {
 	return
 }
 
-func (rb *RBTree) insert(key int, value interface{}) error {
+func (rb *RBTree) insert(key []byte, value []byte) error {
 	var lsm *LSMTree
 	var uncle *RBTreeNode
 	rb.addDataSize(key, value)
-	err := lsm.writeRestoreLog(key, value)
+	err := lsm.writeRestoreLog(key, value, "insert")
 	if err != nil {
 		return err
 	}
+	go lsm.bf.Add(key)
 	if rb.root == nil {
 		rb.root = new(RBTreeNode)
 		rb.root.key = key
@@ -355,7 +371,7 @@ func (rbn *RBTreeNode) deleteLeafAdjust(parent *RBTreeNode) {
 	}
 }
 
-func (rb *RBTree) deleteNode(key int) bool {
+func (rb *RBTree) deleteNode(key []byte) bool {
 	deleted, sign := rb.root.search(key)
 	if sign == false {
 		return false
@@ -407,7 +423,7 @@ func (rb *RBTree) deleteNode(key int) bool {
 	return true
 }
 
-func (rb *RBTree) changeValue(key int, newValue interface{}) bool {
+func (rb *RBTree) changeValue(key []byte, newValue []byte) bool {
 	changeNode, sign := rb.root.search(key)
 	if sign == false {
 		return sign
@@ -417,10 +433,10 @@ func (rb *RBTree) changeValue(key int, newValue interface{}) bool {
 	}
 }
 
-func (rbn *RBTreeNode) search(key int) (*RBTreeNode, bool) {
-	if key == rbn.key {
+func (rbn *RBTreeNode) search(key []byte) (*RBTreeNode, bool) {
+	if bytes.Compare(key, rbn.key) == 0 {
 		return rbn, true
-	} else if key > rbn.key {
+	} else if bytes.Compare(key, rbn.key) == 1 {
 		if rbn.right == nil {
 			return nil, false
 		}
@@ -445,11 +461,11 @@ func (rb *RBTree) inorder(cur *RBTreeNode, num *int) {
 	rb.inorder(cur.right, num)
 }
 
-func (lsm *LSMTree) setMemoryHash(key int, offSet int64, ssTableNum int) {
+func (lsm *LSMTree) setMemoryHash(key []byte, offSet int64, ssTableNum int) {
 	lsm.mu.Lock()
 	defer lsm.mu.Unlock()
 	tmpMap := lsm.memoryHash[ssTableNum]
-	(*tmpMap)[key] = offSet
+	(*tmpMap)[&key] = offSet
 	return
 }
 
@@ -522,12 +538,13 @@ func (lsm *LSMTree) syncToDisk() {
 	}
 }
 
-func (lsm *LSMTree) writeRestoreLog(key int, value interface{}) error {
+func (lsm *LSMTree) writeRestoreLog(key []byte, value []byte, preFix string) error {
 	tmpLogEntry := new(logEntry)
 	tmpLogEntry.data.key = key
 	tmpLogEntry.data.value = value
 	tmpLogEntry.nowTime = time.Now()
 	tmpLogEntry.curTreeNum = lsm.treeNum
+	tmpLogEntry.logPrefix = preFix
 	data, err := json.Marshal(tmpLogEntry)
 	if err != nil {
 		return err
@@ -540,28 +557,30 @@ func (lsm *LSMTree) writeRestoreLog(key int, value interface{}) error {
 }
 
 // return the start-end offset section of the key in memory hash and the segment number.
-func (lsm *LSMTree) searchInSparseHash(key int) ([]int64, []int64, []int) {
+func (lsm *LSMTree) searchInSparseHash(key []byte) ([]int64, []int64, []int) {
 	var start, end []int64
 	var segment []int
 	num := 0
 	for i := lsm.ssTableNum; i > 0; i-- {
-		var keys []int
+		var keys keySet
 		keyNum := 0
 		for hashKey := range *lsm.memoryHash[i] {
-			keys[keyNum] = hashKey
+			keys[keyNum] = *hashKey
 			keyNum++
 		}
-		sort.Ints(keys)
-		index := sort.SearchInts(keys, key)
+		sort.Sort(keys)
+		index := sort.Search(len(keys), func(i int) bool {
+			return bytes.Compare(keys[i], key) == 1
+		})
 		if index == 0 {
 			start[num] = 0
-			end[num] = (*lsm.memoryHash[i])[keys[index]]
+			end[num] = (*lsm.memoryHash[i])[&keys[index]]
 		} else if index == len(keys) {
-			start[num] = (*lsm.memoryHash[i])[keys[index-1]]
+			start[num] = (*lsm.memoryHash[i])[&keys[index-1]]
 			end[num] = -1
 		} else {
-			start[num] = (*lsm.memoryHash[i])[keys[index-1]]
-			end[num] = (*lsm.memoryHash[i])[keys[index]]
+			start[num] = (*lsm.memoryHash[i])[&keys[index-1]]
+			end[num] = (*lsm.memoryHash[i])[&keys[index]]
 		}
 		segment[num] = i
 		num++
@@ -582,7 +601,7 @@ func MakeLSMTree() (*LSMTree, error) {
 	return lsmTree, nil
 }
 
-func (lsm *LSMTree) Write(args *WriteArgs, reply *WriteReply) error {
+func (lsm *LSMTree) Put(args *WriteArgs, reply *WriteReply) error {
 	memoryTree := lsm.memoryTree[lsm.treeNum]
 	memoryTree.mu.Lock()
 	defer memoryTree.mu.Unlock()
@@ -600,7 +619,7 @@ func (lsm *LSMTree) Write(args *WriteArgs, reply *WriteReply) error {
 		lsm.treeNum++
 		lsm.memoryTree[lsm.treeNum] = lsm.initRBTree()
 		lsm.mu.Unlock()
-		err1 := lsm.Write(args, reply)
+		err1 := lsm.Put(args, reply)
 		if err1 != nil {
 			return err1
 		}
@@ -608,8 +627,12 @@ func (lsm *LSMTree) Write(args *WriteArgs, reply *WriteReply) error {
 	return nil
 }
 
-func (lsm *LSMTree) Read(args *ReadArgs, reply *ReadReply) error {
+func (lsm *LSMTree) Get(args *ReadArgs, reply *ReadReply) error {
 	memoryTree := lsm.memoryTree[lsm.treeNum]
+	if lsm.bf.Query(args.Key) == false {
+		reply.Found = false
+		return nil
+	}
 	tmpNode, found := memoryTree.root.search(args.Key)
 	if found == true {
 		reply.Value = tmpNode.value
@@ -631,19 +654,21 @@ func (lsm *LSMTree) Read(args *ReadArgs, reply *ReadReply) error {
 			} else {
 				buf := new(bytes.Buffer)
 				buf.Write(binaryData)
-				var decodingData []dataPair
+				var decodingData []entry
 				err1 := binary.Read(buf, binary.BigEndian, decodingData)
 				if err1 != nil {
 					reply.Found = false
 					reply.err = err1
 					return err1
 				}
-				var keys []int
+				var keys keySet
 				for index, pair := range decodingData {
 					keys[index] = pair.key
 				}
-				keyIndex := sort.SearchInts(keys, args.Key)
-				if decodingData[keyIndex].key == args.Key {
+				keyIndex := sort.Search(len(keys), func(i int) bool {
+					return bytes.Compare(keys[i], args.Key) == 0
+				})
+				if bytes.Compare(decodingData[keyIndex].key, args.Key) == 0 {
 					reply.Found = true
 					reply.Value = decodingData[keyIndex].value
 					reply.err = nil
