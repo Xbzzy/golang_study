@@ -1,8 +1,9 @@
-# ZpaperDB(A distributed B+tree StorageEngine)
-The purpose of this project is to understand how a BTree StorageEngine work in distributed database system.And this whole database system is divide into several module.<br>
+# ZpaperDB(B+tree/LSMtree StorageEngine)
+The purpose of this project is to understand how a BTree/LSMTree StorageEngine work in database system.And this whole database system is divide into several module.<br>
 <br>
 (Function is not yet perfect)<br>
-## 1. B+tree Structure
+# B+tree 
+## 1.B+tree Structure
   B-tree is a self-blancing tree data structure with sorted data and allows serches,sequential access,insertions,and deletions in logarithmic time(depending on the order num).The B-tree is a generalization of a binary search tree in that a node can have more than two children.Unlike self-balancing binary search trees, the B-tree is well suited for storage systems that read and write relatively large blocks of data, such as discs. It is commonly used in databases and file systems.<br>
   <br>
   Because of that B-tree has already existed for a long time.So many optimization measures have been developed.It is called B+Tree.In contrast to B-Tree,the page of B+Tree has only saved the key's thumbnail information.In order to saved more key in index page .On the other hand,every leaf node maybe saved the pointer of its bro of the same order number additional.It's fine like that we can sequential scanning keys without return parent node.<br>
@@ -64,4 +65,5 @@ The purpose of this project is to understand how a BTree StorageEngine work in d
 ### 5.3 Self-adaption Hash Index
 ### 5.4 Async IO
 ### 5.5 Flush Neighbor Page
-## 6. Distributed Module
+# LSMTree
+## 1.LSMTree structure
