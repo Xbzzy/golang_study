@@ -3,7 +3,7 @@ package storage
 // including :
 // 1.sort interface of some data type.
 // 2.Iterator interface.
-// 2.bloom filter to improve read performance.
+// 2.bloom filter.
 // 3.some typical hash func.
 // 4.disk block cache to improve the efficiency of read.
 // 5.RBTree.
@@ -111,10 +111,10 @@ type bloomFilter struct {
 }
 
 type filter struct {
-	keyNum    uint
+	keyNum    uint32
 	bitMap    []byte
-	bitMapLen uint
-	hashNum   int
+	bitMapLen uint32
+	hashNum   int32
 }
 
 func RSHash(key []byte) uint64 {
@@ -204,17 +204,6 @@ func (bf *bloomFilter) optimalBitArrayLen(fpp float64, expectedInsertions int64)
 	return uint64(up / down)
 }
 
-func initHashFunc(hashFunc []func([]byte) uint64) {
-	hashFunc = []func([]byte) uint64{
-		RSHash,
-		BKDRHash,
-		DJBHash,
-		JSHash,
-		SDBMHash,
-		AdlerHash}
-	return
-}
-
 func (bf *bloomFilter) mappingByHash(key []byte) []uint64 {
 	result := make([]uint64, bf.HashNum)
 	for i := 0; i < bf.HashNum; i++ {
@@ -237,8 +226,13 @@ func MakeBloomFilter(fpp float64, expectedInsertions int64) (*bloomFilter, error
 	bf.BitArrayLen = int64(bf.optimalBitArrayLen(fpp, expectedInsertions))
 	bf.ByteArray = make([]byte, (bf.BitArrayLen>>3)+1)
 	bf.HashNum = bf.optimalHashFuncNum(expectedInsertions)
-	bf.HashFunc = make([]func([]byte) uint64, 6)
-	initHashFunc(bf.HashFunc)
+	bf.HashFunc = []func([]byte) uint64{
+		RSHash,
+		BKDRHash,
+		DJBHash,
+		JSHash,
+		SDBMHash,
+		AdlerHash}
 	return bf, nil
 }
 
@@ -269,6 +263,10 @@ func (bf *bloomFilter) checkBitSite(site uint64) bool {
 	return false
 }
 
+func (f *filter) getSize() uint32 {
+	return uint32(len(f.bitMap) + 12)
+}
+
 func (bf *bloomFilter) Add(key []byte) {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
@@ -294,6 +292,19 @@ func (bf *bloomFilter) Query(key []byte) bool {
 	}
 	return true
 }
+
+// RBTree act as a LSMTree memoryTree basic workflow:
+// While writing in, put the data in memory self-balancing tree(Red-Black Tree),
+// this memoryTree called memoryTable,when memoryTable greater than a certain
+// threshold size(usually a few megabytes),write it in disk as a SSTable file.
+// Because memoryTree has been maintained key-value sorted by key, so write disk
+// will be efficient.New SSTable file has been the newest part of the database system.
+// While SSTable writing in disk,write request will insert into new RBtree instance.
+// In order to deal with write request, first try to search key in memory table,
+// then is the newest section of the disk file, the following is more old disk file.
+// And so on, until find the target data(or nil).Background process will perform
+// merge and compress periodically,for perform multi-sectionDiskFile.And discard
+// old data that has been overwritten or deleted.
 
 type RBTree struct {
 	mu           *sync.Mutex
