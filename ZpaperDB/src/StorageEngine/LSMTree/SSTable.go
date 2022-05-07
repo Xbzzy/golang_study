@@ -3,20 +3,14 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/crc32"
 	"ini"
 	"log"
 	"os"
+	"reflect"
 	"strconv"
+	"sync"
 	"time"
-)
-
-const (
-	noCompression     = 0x00
-	snappyCompression = 0x01
-	//check whether is SSTable file.
-	magicNum = 0xdb4775248b80fb57
-	//it means that filter will create an instance while data size bigger than 2^12.
-	filterBase = 12
 )
 
 // SSTable include data block,meta block\meta index block,index block\footer,
@@ -24,42 +18,78 @@ const (
 // data block
 
 type TableBuilder struct {
+	rw          *sync.RWMutex
 	data        *[]pairs
 	ssTableFile *os.File
+	snappy      byte
+	fpp         float32
+	filterBase  byte
 }
 
 type block struct {
-	keyValueSet []pairs
-	blockType   byte
-	checksum    uint32
+	keyValueSet  []pairs
+	restartPoint []int32
+	restartNum   uint32
+	blockType    byte
+	checksum     uint32
+}
+
+type indexBlock struct {
+	keyValueSet  []indexPairs
+	restartPoint []int32
+	restartNum   uint32
+	blockType    byte
+	checksum     uint32
 }
 
 type metaBlock struct {
 	filterData []filter
-	offset     []uint
-	filterSize uint
+	offset     []uint32
+	filterSize uint32
 	filterBase byte
 	blockType  byte
 	checkSum   uint32
 }
 
 type pairs struct {
-	keyLen   uint
-	valueLen uint
+	keyLen   uint32
+	valueLen uint32
 	key      []byte
-	value    interface{}
+	value    []byte
+}
+
+type indexPairs struct {
+	keyLen   uint32
+	valueLen uint32
+	key      []byte
+	value    BlockHandler
+}
+
+func (p *pairs) set(key []byte, value []byte) {
+	p.key = key
+	p.keyLen = uint32(len(key))
+	p.value = value
+	p.valueLen = uint32(len(value))
 }
 
 type footer struct {
 	metaIndexHandle BlockHandler
 	indexHandle     BlockHandler
 	padding         []byte
-	magicNum        [8]byte
+	magicNum        []byte
 }
 
 type BlockHandler struct {
-	offset uint
-	size   uint
+	offset uint32
+	size   uint32
+}
+
+type SSTable struct {
+	dataBlockSet   []block
+	metaBlockSet   []metaBlock
+	metaIndexBlock indexBlock
+	indexBlock     indexBlock
+	footer         footer
 }
 
 type compaction struct {
@@ -68,10 +98,18 @@ type compaction struct {
 	inputFile  [][]*os.File
 }
 
-func (lsm *LSMTree) MakeCompaction() {
+func (lsm *LSMTree) BeginCompaction() {
+	var snappy byte
 	var left, right uint8
 	cfg, _ := ini.Load("lsm.ini")
 	maxNum, _ := cfg.Section("SSTable").Key("maxFileOfOneLevel").Int()
+	tmpSnappy, _ := cfg.Section("SSTable").Key("snappyCompression").Bool()
+	if tmpSnappy == true {
+		snappy = 0x1
+	} else {
+		snappy = 0x0
+	}
+	fpp, _ := cfg.Section("SSTable").Key("filterFpp").Float64()
 	cp := new(compaction)
 	cp.maxFileNum = maxNum
 	cp.inputFile = make([][]*os.File, 20)
@@ -81,21 +119,27 @@ func (lsm *LSMTree) MakeCompaction() {
 		cp.inputFile[i] = lsm.ssTableFile[left:right]
 		left = right
 	}
+	go lsm.checkMemTableSize()
 	go func() {
 		for {
-			if lsm.table.fulled == true {
-				lsm.mu.Lock()
-				lsm.levelNum[0]++
-				tb := new(TableBuilder)
-				tb.data = lsm.table.str.export()
-				lsm.table.str = lsm.initSkipList()
-				lsm.table.fulled = false
-				lsm.mu.Unlock()
-				tb.ssTableFile, _ = os.Create("./data/level0/ssTable" + strconv.Itoa(lsm.ssTableNum))
-				cp.inputFile[0] = append(cp.inputFile[0], tb.ssTableFile)
-				tb.minorCompress()
-				time.Sleep(10 * time.Second)
+			<-lsm.table.fulled
+			lsm.mu.Lock()
+			lsm.levelNum[0]++
+			tb := new(TableBuilder)
+			tb.data = lsm.table.str.export()
+			tb.snappy = snappy
+			tb.fpp = float32(fpp)
+			tb.filterBase = 12
+			lsm.table.str = lsm.initSkipList()
+			lsm.table.size = 0
+			lsm.mu.Unlock()
+			tb.ssTableFile, _ = os.Create("./data/level0/ssTable" + strconv.Itoa(lsm.ssTableNum))
+			cp.inputFile[0] = append(cp.inputFile[0], tb.ssTableFile)
+			err := tb.minorCompress()
+			if err != nil {
+				log.Fatalln(err)
 			}
+			time.Sleep(10 * time.Second)
 		}
 	}()
 	go func() {
@@ -111,126 +155,202 @@ func (lsm *LSMTree) MakeCompaction() {
 	}()
 }
 
-func (tb *TableBuilder) minorCompress() {
+func (tb *TableBuilder) minorCompress() error {
+	var i, j, k int32
+	data := *tb.data
+	offset := *tb.segmentKV()
+	dataBlockSet := make([]*block, 0, 1024)
+	for offset[i] != 0 {
+		dataBlockSet = append(dataBlockSet, tb.buildDataBlock(data[j:offset[i]+1]))
+		j = offset[i] + 1
+		k++
+	}
+	dataBlockNum := len(dataBlockSet)
+	dataBlockSize := uint32(dataBlockNum * 4096)
+	metaBlockSet := tb.buildMetaBlock(dataBlockSet)
+	metaBlockNum := len(metaBlockSet)
+	metaBlockSize := uint32(metaBlockNum * 4096)
+	metaIndexBlock := tb.buildMetaIndexBlock(metaBlockSet, uint32(len(dataBlockSet)*4096))
+	dataIndexBlock := tb.buildIndexBlock(dataBlockSet)
+	footerBlock := tb.buildFooter(BlockHandler{
+		offset: dataBlockSize + metaBlockSize,
+		size:   4096,
+	}, BlockHandler{
+		offset: dataBlockSize + metaBlockSize + 4096,
+		size:   4096,
+	})
+	var num int
+	ssTable := new(SSTable)
+	ssTable.dataBlockSet = make([]block, dataBlockNum)
+	ssTable.metaBlockSet = make([]metaBlock, metaBlockNum)
+	for num = 0; num < dataBlockNum; num++ {
+		ssTable.dataBlockSet[num] = *dataBlockSet[num]
+	}
+	for num = 0; num < metaBlockNum; num++ {
+		ssTable.metaBlockSet[num] = *metaBlockSet[num]
+	}
+	ssTable.metaIndexBlock = *metaIndexBlock
+	ssTable.indexBlock = *dataIndexBlock
+	ssTable.footer = *footerBlock
+	err := binary.Write(tb.ssTableFile, binary.LittleEndian, ssTable)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
+func (tb *TableBuilder) segmentKV() *[]int32 {
+	var j, sign int
+	var size uint32 = 9 //
+	indexSet := make([]int32, 256, 1024)
+	data := *tb.data
+	pairNum := len(*tb.data)
+	for i := 0; i < pairNum; i++ {
+		size += data[i].keyLen + data[i].valueLen + 8
+		sign++
+		if sign%16 == 0 {
+			size += 4
+		}
+		if size > 4096 {
+			i--
+			indexSet[j] = int32(i)
+			j++
+			size = 9 //reset size
+			sign = 0 //reset sign
+		}
+		if i == pairNum-1 {
+			indexSet[j] = int32(i)
+		}
+	}
+	return &indexSet
 }
 
 func (cp *compaction) majorCompress() {
 
 }
 
-func (b *BlockHandler) set(offset uint, size uint) {
+func (b *BlockHandler) set(offset uint32, size uint32) {
 	b.offset = offset
 	b.size = size
 }
 
-func (b *BlockHandler) get() (uint, uint) {
+func (b *BlockHandler) get() (uint32, uint32) {
 	return b.offset, b.size
 }
 
-func (tb *TableBuilder) buildDataBlock(pair []pairs) ([]*block, []uint, uint) {
-	var i, k, l = 0, 0, 1
-	var size, totalSize uint
-	offset := make([]uint, 1024)
-	offset[0] = 8
-	blockSet := make([]*block, 1024)
-	for {
-		blockSet[k] = new(block)
-		size += pair[i].keyLen + pair[i].valueLen + 8
-		totalSize += size
-		if size > 4091 { // 4096-5
-			blockSet[k].keyValueSet = pair[:i-1]
-			offset[l] = offset[l-1] + (size - pair[i].keyLen - pair[i].valueLen - 13)
-			l++
-			i = 0
+func (tb *TableBuilder) buildDataBlock(pair []pairs) *block {
+	var j, k = 0, 1
+	var offset uint32
+	pairNum := len(pair)
+	newBlock := new(block)
+	newBlock.keyValueSet = make([]pairs, pairNum)
+	newBlock.restartPoint = make([]int32, pairNum/16+1)
+	newBlock.restartNum = uint32(pairNum/16 + 1)
+	newBlock.blockType = tb.snappy
+	for i := 0; i < pairNum; i++ {
+		newBlock.keyValueSet[i] = pair[i]
+		offset += pair[i].keyLen + pair[i].valueLen + 8
+		j++
+		if j == 16 {
+			newBlock.restartPoint[k] = int32(offset)
 			k++
-		}
-		i++
-		if i > len(pair) {
-			break
+			j = 0
 		}
 	}
-	return blockSet, offset, totalSize
+	return newBlock
 }
 
-func (tb *TableBuilder) buildMetaBlock(dataBlockSize uint, dataBlock []*block) ([]*metaBlock, []uint, uint) {
-	var k, l, o int
-	var size, filterNum, totalSize int
-	blockOffset := make([]uint, 200)
-	filterSet := make([]filter, 200)
-	blockSet := make([]*metaBlock, 200)
-	for i := 0; i < len(dataBlock); i++ {
-		insertions := len(dataBlock[i].keyValueSet)
-		newFilter, _ := MakeBloomFilter(0.01, int64(insertions))
-		filterNum++
-		for j := 0; j < insertions; j++ {
+func (tb *TableBuilder) buildMetaBlock(dataBlock []*block) []*metaBlock {
+	var k int
+	var filterSize, curBlockSize uint32 = 0, 10
+	filterSet := make([]filter, 0, 200)
+	offsetSet := make([]uint32, 0, 200)
+	offsetSet = append(offsetSet, 0)
+	blockSet := make([]*metaBlock, 0, 200)
+	for i := 0; i < len(dataBlock)-1; i++ {
+		pairNum := int64(len(dataBlock[i].keyValueSet))
+		newFilter, _ := MakeBloomFilter(0.01, pairNum)
+		for j := 0; j < int(pairNum); j++ {
 			newFilter.Add(dataBlock[i].keyValueSet[j].key)
 		}
-		tmpFilter := new(filter)
-		tmpFilter.keyNum = uint(newFilter.ElementNum)
-		tmpFilter.bitMap = newFilter.ByteArray
-		tmpFilter.hashNum = newFilter.HashNum
-		tmpFilter.bitMapLen = uint(newFilter.BitArrayLen)
-		filterSet[k] = *tmpFilter
+		filterSet = append(filterSet, filter{
+			keyNum:    uint32(newFilter.ElementNum),
+			bitMap:    newFilter.ByteArray,
+			bitMapLen: uint32(newFilter.BitArrayLen),
+			hashNum:   int32(newFilter.HashNum),
+		})
+		filterSize += filterSet[k].getSize()
+		curBlockSize = filterSize + 4
 		k++
-		size += len(newFilter.ByteArray)
-		totalSize += size
-		if size > 4086-filterNum*4 {
-			blockSet[l].filterData = filterSet[:k-1]
-			filterSet[0] = filterSet[k]
-			blockSet[l].filterSize = uint(size - len(filterSet[k].bitMap) - 12)
-			blockSet[l].blockType = noCompression
-			blockSet[l].filterBase = filterBase
-			blockOffset[o] = dataBlockSize + blockSet[l].filterSize + uint(4*filterNum) + 6
-			o++
-			blockSet[l].offset = make([]uint, filterNum)
-			var offset uint = 0
-			for u := 0; u < filterNum; u++ {
-				blockSet[l].offset[u] = offset
-				offset += uint(len(filterSet[k].bitMap)) + 12
-			}
-			size, filterNum, k = 0, 0, 1
+		offsetSet = append(offsetSet, filterSize)
+		if curBlockSize > 4096 {
+			newMetaBlock := new(metaBlock)
+			newMetaBlock.filterData = filterSet[:k-1]
+			newMetaBlock.offset = offsetSet[:k-1]
+			newMetaBlock.filterSize = filterSize - filterSet[k-1].getSize() - filterSet[k-2].getSize()
+			newMetaBlock.filterBase = 0x12
+			blockSet = append(blockSet, newMetaBlock)
+			i--
+			filterSize = 0
+			curBlockSize = 10
+			offsetSet = offsetSet[:1]
+			filterSet = filterSet[0:0]
+			k = 0
 		}
 	}
-	return blockSet, blockOffset, uint(totalSize)
+	blockSet = append(blockSet, &metaBlock{
+		filterData: filterSet[:],
+		offset:     offsetSet[:],
+		filterSize: filterSize,
+		filterBase: 0x12,
+		blockType:  0,
+		checkSum:   0,
+	})
+	return blockSet
 }
 
-func (tb *TableBuilder) buildMetaIndexBlock(metaBlock []*metaBlock, offset []uint) *block {
-	var key []byte
-	buf := new(bytes.Buffer)
-	err := binary.Write(buf, binary.BigEndian, "zpaperdb.filter")
-	if err != nil {
-		log.Fatal(err)
-	}
-	_, err1 := buf.Read(key)
-	if err1 != nil {
-		log.Fatal(err1)
-	}
-	metaIndexBlock := new(block)
-	metaIndexBlock.keyValueSet = make([]pairs, len(metaBlock))
+func (tb *TableBuilder) buildMetaIndexBlock(metaBlock []*metaBlock, startOffset uint32) *indexBlock {
+	var j, k = 0, 1
+	key := binaryData("BloomFilter.zpaperdb")
+	metaIndexBlock := new(indexBlock)
+	metaIndexBlock.keyValueSet = make([]indexPairs, len(metaBlock))
+	metaIndexBlock.restartPoint = make([]int32, len(metaBlock)/16+1)
 	for i := 0; i < len(metaBlock); i++ {
 		metaIndexBlock.keyValueSet[i].key = key
-		metaIndexBlock.keyValueSet[i].keyLen = 15
+		metaIndexBlock.keyValueSet[i].keyLen = 20
 		tmpHandle := new(BlockHandler)
-		tmpHandle.set(offset[i], offset[i+1]-offset[i])
+		tmpHandle.set(startOffset+uint32(i*4096), 4096)
+		j++
+		if j == 16 {
+			metaIndexBlock.restartPoint[k] = int32(i * 4096)
+			k++
+			j = 0
+		}
 		metaIndexBlock.keyValueSet[i].value = *tmpHandle
 		metaIndexBlock.keyValueSet[i].valueLen = 8
 	}
 	return metaIndexBlock
 }
 
-func (tb *TableBuilder) buildIndexBlock(dataBlock []*block, offset []uint) *block {
-	indexBlock := new(block)
-	indexBlock.keyValueSet = make([]pairs, len(dataBlock))
+func (tb *TableBuilder) buildIndexBlock(dataBlock []*block) *indexBlock {
+	var j, k = 0, 1
+	tmpIndexBlock := new(indexBlock)
+	tmpIndexBlock.keyValueSet = make([]indexPairs, len(dataBlock))
 	for i := 0; i < len(dataBlock); i++ {
-		indexBlock.keyValueSet[i].key = dataBlock[i].keyValueSet[i].key
-		indexBlock.keyValueSet[i].keyLen = dataBlock[i].keyValueSet[i].keyLen
+		tmpIndexBlock.keyValueSet[i].key = dataBlock[i].keyValueSet[0].key
+		tmpIndexBlock.keyValueSet[i].keyLen = dataBlock[i].keyValueSet[0].keyLen
 		tmpHandle := new(BlockHandler)
-		tmpHandle.set(offset[i], offset[i+1]-offset[i])
-		indexBlock.keyValueSet[i].valueLen = 8
-		indexBlock.keyValueSet[i].value = *tmpHandle
+		tmpHandle.set(uint32(i*4096), 4096)
+		j++
+		if j == 16 {
+			tmpIndexBlock.restartPoint[k] = int32(i * 4096)
+			k++
+			j = 0
+		}
+		tmpIndexBlock.keyValueSet[i].valueLen = 8
+		tmpIndexBlock.keyValueSet[i].value = *tmpHandle
 	}
-	return indexBlock
+	return tmpIndexBlock
 }
 
 func (tb *TableBuilder) buildFooter(metaIndex, index BlockHandler) *footer {
@@ -238,6 +358,56 @@ func (tb *TableBuilder) buildFooter(metaIndex, index BlockHandler) *footer {
 	tmpFooter.indexHandle = index
 	tmpFooter.metaIndexHandle = metaIndex
 	tmpFooter.padding = make([]byte, 24)
-	tmpFooter.magicNum = magicNum
+	tmpFooter.magicNum = binaryData("db4775248b80fb57")
 	return tmpFooter
+}
+
+func binaryData(data interface{}) []byte {
+	buf := new(bytes.Buffer)
+	sign, typeValue := checkKVType(data)
+	if sign == false {
+		return nil
+	} else {
+		if typeValue == 0x1 {
+			data = []byte(reflect.ValueOf(data).String())
+		}
+	}
+	err := binary.Write(buf, binary.LittleEndian, data)
+	if err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func checkKVType(data interface{}) (bool, byte) {
+	switch reflect.TypeOf(data).Kind() {
+	case reflect.String:
+		return true, 0x1
+	case reflect.Uint8:
+		return true, 0x2
+	case reflect.Uint16:
+		return true, 0x3
+	case reflect.Uint32:
+		return true, 0x4
+	case reflect.Uint64:
+		return true, 0x5
+	case reflect.Int8:
+		return true, 0x6
+	case reflect.Int16:
+		return true, 0x7
+	case reflect.Int32:
+		return true, 0x8
+	case reflect.Int64:
+		return true, 0x9
+	case reflect.Float32:
+		return true, 0x10
+	case reflect.Float64:
+		return true, 0x11
+	default:
+		return false, 0x0
+	}
+}
+
+func getCRC32(data []byte) uint32 {
+	return crc32.ChecksumIEEE(data)
 }
